@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Each step tees its full output to ci-logs/ so the exact failure text is
+      # downloadable as a build artifact (uploaded even on failure below).
+      - name: Check formatting
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          {
+            echo "== gofmt =="
+            unformatted="$(gofmt -l .)"
+            if [ -n "$unformatted" ]; then
+              echo "gofmt found unformatted files:"
+              echo "$unformatted"
+              echo "Fix locally with: ./hermes-fleet-bridge-go.sh gofmt -w ."
+              exit 1
+            fi
+          } 2>&1 | tee ci-logs/gofmt.log
+      # Tee-ing the output must not swallow a non-zero exit: without pipefail
+      # the step reports tee's status (0) and a red test/vet/build merges green.
+      - name: Test
+        shell: bash
+        run: go test -race ./... 2>&1 | tee ci-logs/test.log
+      - name: Vet
+        shell: bash
+        run: go vet ./... 2>&1 | tee ci-logs/vet.log
+      - name: Build
+        shell: bash
+        run: go build . 2>&1 | tee ci-logs/build.log
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ci-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+
+  compose:
+    name: Compose config
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+      # Fail if docker-compose.yml has invalid YAML or bad interpolation. No
+      # container is started. .env is gitignored, so supply a dummy for the
+      # env_file reference.
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config >/dev/null

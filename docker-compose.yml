@@ -1,0 +1,17 @@
+services:
+  hermes-fleet-bridge:
+    build: .
+    container_name: hermes-fleet-bridge
+    restart: unless-stopped
+    network_mode: host # Linux: access Hermes' Docker bridge IPs without network reconfiguration
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

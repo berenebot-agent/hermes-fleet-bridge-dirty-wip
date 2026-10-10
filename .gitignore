@@ -1,0 +1,14 @@
+# Persistent runtime state (bind-mounted at /data). Never commit: it holds the
+# Telegram update offset, topic IDs and queued messages.
+data/
+
+# Secrets — real credentials only; the template is tracked.
+.env
+
+# Local build artifacts and data backups. Zip archives here are release
+# bundles or ./data backups (large, and backups contain chat state).
+*.zip
+bridge
+
+# Test logs (gitignored, persistent across runs).
+tests/logs/
