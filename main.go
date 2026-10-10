@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,14 +22,20 @@ const generalThread = 1
 type App struct {
 	cfg       Config
 	docker    *Docker
+	compose   *Compose
 	telegram  *Telegram
 	state     *Store
 	busy      map[string]*atomic.Bool
 	lifecycle map[string]*sync.Mutex
+	dirs      map[string]string
 	all       []string
+	active    []string
 	issuesMu  sync.Mutex
 	issues    map[string]string
 }
+
+// dir resolves a member name to its compose project directory. Empty if unknown.
+func (a *App) dir(agent string) string { return a.dirs[agent] }
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.LUTC)
@@ -40,38 +47,41 @@ func main() {
 	if err != nil {
 		log.Fatal("state: ", err)
 	}
-	a := &App{cfg: cfg, docker: newDocker(cfg.DockerSocket), telegram: newTelegram(cfg.Token, cfg.GroupID), state: st, busy: map[string]*atomic.Bool{}, lifecycle: map[string]*sync.Mutex{}, all: append([]string(nil), cfg.Containers...), issues: map[string]string{}}
+	a := &App{cfg: cfg, docker: newDocker(cfg.DockerSocket), compose: newCompose(), telegram: newTelegram(cfg.Token, cfg.GroupID), state: st, busy: map[string]*atomic.Bool{}, lifecycle: map[string]*sync.Mutex{}, dirs: map[string]string{}, issues: map[string]string{}}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := a.telegram.deleteWebhook(ctx); err != nil {
 		log.Printf("Telegram webhook reset: %v", err)
 	}
 	started := time.Now().UTC()
-	// Only service containers that exist; report the rest in General.
-	var active []string
-	for _, name := range cfg.Containers {
-		a.busy[name] = &atomic.Bool{}
-		a.lifecycle[name] = &sync.Mutex{}
-		if err := st.touch(name); err != nil {
+	// A member is a compose project directory. Its container is ephemeral, so a
+	// missing or stopped container is not a reason to drop it from the fleet; the
+	// bridge brings it up on demand. Only a missing compose file/ directory is an
+	// unusable configuration.
+	var active []Member
+	for _, m := range cfg.Members {
+		a.busy[m.Name] = &atomic.Bool{}
+		a.lifecycle[m.Name] = &sync.Mutex{}
+		a.dirs[m.Name] = m.Dir
+		a.all = append(a.all, m.Name)
+		if err := st.touch(m.Name); err != nil {
 			log.Fatal("state write: ", err)
 		}
-		if _, err := a.docker.inspect(ctx, name); err != nil {
-			if errors.Is(err, errContainerNotFound) {
-				a.setIssue(name, "container not found")
-				log.Printf("container %s not found; skipping topic, reporting in General", name)
-			} else {
-				a.setIssue(name, safeErr(err))
-				log.Printf("container %s inspect failed: %v", name, err)
-			}
+		if _, err := composeFile(m.Dir); err != nil {
+			a.setIssue(m.Name, "no compose file in project directory")
+			log.Printf("member %s: %v; skipping, reporting in General", m.Name, err)
 			continue
 		}
-		active = append(active, name)
+		active = append(active, m)
 	}
-	a.cfg.Containers = active
-	log.Printf("bridge configured: %d/%d Hermes containers, group %d, idle %v; service messages in General", len(active), len(cfg.Containers), cfg.GroupID, cfg.IdleTimeout)
-	go a.notifyGeneral(a.serviceStartMessage(active, started))
-	for _, agent := range cfg.Containers {
-		go a.agentWorker(ctx, agent)
+	a.cfg.Members = active
+	for _, m := range active {
+		a.active = append(a.active, m.Name)
+	}
+	log.Printf("bridge configured: %d/%d Hermes members, group %d, idle %v; service messages in General", len(active), len(cfg.Members), cfg.GroupID, cfg.IdleTimeout)
+	go a.notifyGeneral(a.serviceStartMessage(a.active, started))
+	for _, m := range active {
+		go a.agentWorker(ctx, m.Name)
 	}
 	go a.idleMonitor(ctx)
 	go a.topicMonitor(ctx)
@@ -80,7 +90,7 @@ func main() {
 
 func (a *App) topicMonitor(ctx context.Context) {
 	a.syncTopics(ctx)
-	a.checkContainers(ctx)
+	a.checkMembers(ctx)
 	tick := time.NewTicker(1 * time.Minute)
 	defer tick.Stop()
 	for {
@@ -89,22 +99,19 @@ func (a *App) topicMonitor(ctx context.Context) {
 			return
 		case <-tick.C:
 			a.syncTopics(ctx)
-			a.checkContainers(ctx)
+			a.checkMembers(ctx)
 		}
 	}
 }
 
-// checkContainers re-inspects every configured container and reports issue
-// transitions (appeared, changed, recovered) in General.
-func (a *App) checkContainers(ctx context.Context) {
+// checkMembers verifies each configured member's project is usable and reports
+// issue transitions (appeared, changed, recovered) in General. A stopped or
+// absent container is normal and is not an issue.
+func (a *App) checkMembers(ctx context.Context) {
 	before := a.issueSnapshot()
 	for _, name := range a.all {
-		if _, err := a.docker.inspect(ctx, name); err != nil {
-			if errors.Is(err, errContainerNotFound) {
-				a.setIssue(name, "container not found")
-			} else {
-				a.setIssue(name, safeErr(err))
-			}
+		if _, err := composeFile(a.dir(name)); err != nil {
+			a.setIssue(name, "no compose file in project directory")
 			continue
 		}
 		a.clearIssue(name)
@@ -115,14 +122,14 @@ func (a *App) checkContainers(ctx context.Context) {
 		newMsg, has := after[name]
 		switch {
 		case has && (!had || oldMsg != newMsg):
-			a.notifyGeneral(fmt.Sprintf("⚠️ Container %s: %s", name, newMsg))
+			a.notifyGeneral(fmt.Sprintf("⚠️ Member %s: %s", name, newMsg))
 		case had && !has:
-			a.notifyGeneral(fmt.Sprintf("✅ Container %s: recovered", name))
+			a.notifyGeneral(fmt.Sprintf("✅ Member %s: recovered", name))
 		}
 	}
 }
 func (a *App) syncTopics(ctx context.Context) {
-	for _, agent := range a.cfg.Containers {
+	for _, agent := range a.active {
 		if err := a.ensureTopic(ctx, agent, false); err != nil {
 			log.Printf("topic %s: %v", agent, err)
 		}
@@ -167,7 +174,7 @@ func isMissingTopic(err error) bool {
 	return strings.Contains(s, "thread not found") || strings.Contains(s, "message_thread_invalid") || strings.Contains(s, "topic_id_invalid") || strings.Contains(s, "topic_deleted")
 }
 func (a *App) getAgentForThread(thread int) string {
-	for _, agent := range a.cfg.Containers {
+	for _, agent := range a.active {
 		if t, ok := a.state.topic(agent); ok && t.ID == thread {
 			return agent
 		}
@@ -210,6 +217,9 @@ func helpMessage() string {
 
 // notifyGeneral best-effort posts a service message; failures don't stop the bridge.
 func (a *App) notifyGeneral(text string) {
+	if a.telegram == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := a.telegram.sendMessage(ctx, generalThread, text); err != nil {
@@ -219,9 +229,11 @@ func (a *App) notifyGeneral(text string) {
 func (a *App) serviceStartMessage(active []string, started time.Time) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Hermes Fleet Bridge online (%s UTC)\n", started.Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(&b, "Serving %d/%d containers, idle timeout %v", len(active), len(a.all), a.cfg.IdleTimeout)
+	fmt.Fprintf(&b, "Serving %d/%d members, idle timeout %v", len(active), len(a.all), a.cfg.IdleTimeout)
 	for _, n := range active {
-		fmt.Fprintf(&b, "\n- %s -> %s", n, topicName(n))
+		// Get container status for this member
+		status := a.memberStatus(n)
+		fmt.Fprintf(&b, "\n- %s %s -> %s", status, n, topicName(n))
 	}
 	if issues := a.issueSnapshot(); len(issues) > 0 {
 		b.WriteString("\nIssues:")
@@ -232,6 +244,33 @@ func (a *App) serviceStartMessage(active []string, started time.Time) string {
 		}
 	}
 	return b.String()
+}
+
+// memberStatus returns an emoji indicating the container's running state.
+func (a *App) memberStatus(name string) string {
+	ctx := context.Background()
+	// Try to inspect the container directly first
+	if a.docker != nil {
+		info, err := a.docker.inspect(ctx, name)
+		if err == nil && info.State.Running {
+			return "🟢"
+		}
+	}
+
+	// Fallback to compose status if direct inspection fails
+	if a.compose == nil || a.dirs[name] == "" {
+		return "⚪"
+	}
+
+	running, _, err := a.compose.status(ctx, a.dirs[name])
+	if err != nil {
+		return "⚪"
+	}
+
+	if running {
+		return "🟢"
+	}
+	return "🔴"
 }
 func (a *App) setIssue(name, issue string) {
 	a.issuesMu.Lock()
@@ -255,9 +294,10 @@ func (a *App) issueSnapshot() map[string]string {
 func (a *App) statusMessage() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Hermes Fleet Bridge status (%s UTC)", time.Now().UTC().Format("15:04:05"))
-	fmt.Fprintf(&b, "\n- Serving: %d container(s)", len(a.cfg.Containers))
-	for _, n := range a.cfg.Containers {
-		fmt.Fprintf(&b, "\n- %s -> %s", n, topicName(n))
+	fmt.Fprintf(&b, "\n- Serving: %d member(s)", len(a.active))
+	for _, n := range a.active {
+		status := a.memberStatus(n)
+		fmt.Fprintf(&b, "\n- %s %s -> %s", status, n, topicName(n))
 	}
 	issues := a.issueSnapshot()
 	b.WriteString("\n- Issues: none")
@@ -439,35 +479,66 @@ func (a *App) ensureHermes(ctx context.Context, agent string) (*Hermes, error) {
 	lock := a.lifecycle[agent]
 	lock.Lock()
 	defer lock.Unlock()
-	info, err := a.docker.inspect(ctx, agent)
+
+	// Own the API server contract in the member's persistent .env. Hermes loads
+	// that file with override=true, so it (not the Docker env) is authoritative.
+	key, changed, err := a.compose.ensureAPIEnv(ctx, a.dir(agent), strconv.Itoa(a.cfg.DefaultPort), a.state.apiKey(agent))
 	if err != nil {
 		return nil, err
 	}
-	if !info.State.Running {
-		log.Printf("starting sleeping container %s", agent)
-		if err := a.docker.start(ctx, agent); err != nil {
+	if err := a.state.setAPIKey(agent, key); err != nil {
+		return nil, err
+	}
+
+	running, _, err := a.compose.status(ctx, a.dir(agent))
+	if err != nil {
+		return nil, err
+	}
+	if !running || changed {
+		if changed && running {
+			log.Printf("member %s: API server env changed; recreating", agent)
+		} else {
+			log.Printf("waking member %s", agent)
+		}
+		// Notify General that this member is starting
+		a.notifyGeneral(fmt.Sprintf("🔄 Member %s: starting...", agent))
+		if err := a.compose.up(ctx, a.dir(agent), changed && running); err != nil {
+			a.notifyGeneral(fmt.Sprintf("❌ Member %s: failed to start: %v", agent, err))
 			return nil, err
 		}
 	}
+
+	// Wait for the member's API server to answer /health.
 	deadlineCtx, cancel := context.WithTimeout(ctx, a.cfg.StartTimeout)
 	defer cancel()
 	var lastErr error
 	for deadlineCtx.Err() == nil {
-		info, lastErr = a.docker.inspect(deadlineCtx, agent)
-		if lastErr == nil && info.State.Running {
-			var base, key string
-			base, key, lastErr = a.cfg.hermesEndpoint(info)
-			if lastErr == nil {
-				h := newHermes(base, key)
-				if lastErr = h.ready(deadlineCtx); lastErr == nil {
-					a.clearIssue(agent)
-					return h, nil
+		_, primary, serr := a.compose.status(deadlineCtx, a.dir(agent))
+		if serr != nil {
+			lastErr = serr
+		} else if primary != "" {
+			info, ierr := a.docker.inspect(deadlineCtx, primary)
+			if ierr != nil {
+				lastErr = ierr
+			} else if info.State.Running {
+				base, eerr := a.cfg.hermesEndpoint(info)
+				if eerr != nil {
+					lastErr = eerr
+				} else {
+					h := newHermes(base, key)
+					if rerr := h.ready(deadlineCtx); rerr == nil {
+						a.clearIssue(agent)
+						a.notifyGeneral(fmt.Sprintf("✅ Member %s: started", agent))
+						return h, nil
+					} else {
+						lastErr = rerr
+					}
 				}
 			}
 		}
 		sleep(deadlineCtx, 2*time.Second)
 	}
-	return nil, fmt.Errorf("Hermes %s not ready after %s: %v", agent, a.cfg.StartTimeout, lastErr)
+	return nil, fmt.Errorf("member %s not ready after %s: %v", agent, a.cfg.StartTimeout, lastErr)
 }
 func (a *App) idleMonitor(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
@@ -482,7 +553,7 @@ func (a *App) idleMonitor(ctx context.Context) {
 	}
 }
 func (a *App) stopIdle(ctx context.Context) {
-	for _, agent := range a.cfg.Containers {
+	for _, agent := range a.active {
 		if a.busy[agent].Load() || !a.state.idle(agent, time.Now(), a.cfg.IdleTimeout) {
 			continue
 		}
@@ -490,13 +561,14 @@ func (a *App) stopIdle(ctx context.Context) {
 		lock.Lock()
 		// Recheck after taking the lock: a new message may have been accepted in between.
 		if !a.busy[agent].Load() && a.state.idle(agent, time.Now(), a.cfg.IdleTimeout) {
-			info, err := a.docker.inspect(ctx, agent)
+			running, _, err := a.compose.status(ctx, a.dir(agent))
 			if err != nil {
-				log.Printf("idle inspect %s: %v", agent, err)
-			} else if info.State.Running {
-				log.Printf("stopping idle container %s", agent)
-				if err := a.docker.stop(ctx, agent); err != nil {
-					log.Printf("stop %s: %v", agent, err)
+				log.Printf("idle status %s: %v", agent, err)
+			} else if running {
+				log.Printf("stopping idle member %s", agent)
+				a.notifyGeneral(fmt.Sprintf("🛑 Member %s: stopping (idle)", agent))
+				if err := a.compose.down(ctx, a.dir(agent)); err != nil {
+					log.Printf("down %s: %v", agent, err)
 				}
 			}
 		}

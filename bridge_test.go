@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -97,7 +98,7 @@ func TestTelegramAutoTopics(t *testing.T) {
 	s, _ := openStore(t.TempDir(), -1009)
 	tg := newTelegram("TEST", -1009)
 	tg.base = server.URL + "/botTEST/"
-	a := &App{cfg: Config{Containers: []string{"hermes-atlas"}}, state: s, telegram: tg}
+	a := &App{cfg: Config{Members: []Member{{Name: "hermes-atlas"}}}, state: s, telegram: tg}
 	if err := a.ensureTopic(context.Background(), "hermes-atlas", false); err != nil {
 		t.Fatal(err)
 	}
@@ -121,14 +122,14 @@ func TestTelegramAutoTopics(t *testing.T) {
 func TestSleepingContainerWakeRunTypingAndReply(t *testing.T) {
 	var mu sync.Mutex
 	running := false
-	starts := 0
+	ups := 0
 	posts := 0
 	statuses := 0
 	typings := 0
 	replies := []string{}
 	sessionID := ""
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer api-secret" {
+		if r.Header.Get("Authorization") != "Bearer api-secret-0123456789abcdef" {
 			http.Error(w, "unauthorised", 401)
 			return
 		}
@@ -169,11 +170,7 @@ func TestSleepingContainerWakeRunTypingAndReply(t *testing.T) {
 		defer mu.Unlock()
 		switch r.URL.Path {
 		case "/containers/hermes-atlas/json":
-			_ = json.NewEncoder(w).Encode(map[string]any{"Name": "/hermes-atlas", "State": map[string]any{"Running": running}, "Config": map[string]any{"Env": []string{"API_SERVER_KEY=api-secret", "API_SERVER_PORT=" + apiPort}}, "HostConfig": map[string]any{"NetworkMode": "host"}})
-		case "/containers/hermes-atlas/start":
-			running = true
-			starts++
-			w.WriteHeader(204)
+			_ = json.NewEncoder(w).Encode(map[string]any{"Name": "/hermes-atlas", "State": map[string]any{"Running": running}, "Config": map[string]any{"Env": []string{"API_SERVER_PORT=" + apiPort}}, "HostConfig": map[string]any{"NetworkMode": "host"}})
 		default:
 			http.Error(w, "invalid Docker operation", 404)
 		}
@@ -200,6 +197,49 @@ func TestSleepingContainerWakeRunTypingAndReply(t *testing.T) {
 	}))
 	defer telegramServer.Close()
 
+	// Compose fake: the member starts asleep; `up` wakes it. API env is served
+	// from a persistent data/.env whose key the bridge must adopt (not rewrite).
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(dataDir, ".env")
+	if err := os.WriteFile(envPath, []byte("API_SERVER_KEY=api-secret-0123456789abcdef\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("services: {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	compose := newCompose()
+	compose.exec = func(ctx context.Context, args ...string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		rest := args
+		if len(rest) > 0 && rest[0] == "-f" {
+			rest = rest[4:] // skip -f <file> --project-directory <dir>
+		}
+		switch {
+		case rest[0] == "ps":
+			state := "created"
+			if running {
+				state = "running"
+			}
+			return []byte(fmt.Sprintf(`{"Name":"hermes-atlas","State":%q,"Service":"hermes-atlas"}`+"\n", state)), nil
+		case rest[0] == "up":
+			running = true
+			ups++
+			return nil, nil
+		case rest[0] == "down":
+			running = false
+			return nil, nil
+		case rest[0] == "config":
+			return []byte(fmt.Sprintf(`{"services":{"hermes-atlas":{"volumes":[{"type":"bind","source":%q,"target":"/opt/data"}]}}}`, dataDir)), nil
+		default:
+			return nil, fmt.Errorf("unexpected compose args %v", rest)
+		}
+	}
+
 	s, _ := openStore(t.TempDir(), -1009)
 	if err := s.setTopic("hermes-atlas", Topic{ID: 123, Title: "Atlas"}); err != nil {
 		t.Fatal(err)
@@ -214,25 +254,46 @@ func TestSleepingContainerWakeRunTypingAndReply(t *testing.T) {
 	tg := newTelegram("TEST", -1009)
 	tg.base = telegramServer.URL + "/botTEST/"
 	cfg := Config{GroupID: -1009, DefaultPort: 8642, StartTimeout: 5 * time.Second, RunTimeout: time.Minute}
-	a := &App{cfg: cfg, state: s, telegram: tg, docker: newDocker(socket), lifecycle: map[string]*sync.Mutex{"hermes-atlas": &sync.Mutex{}}, busy: map[string]*atomic.Bool{"hermes-atlas": &atomic.Bool{}}, issues: map[string]string{}}
+	a := &App{cfg: cfg, state: s, telegram: tg, docker: newDocker(socket), compose: compose, dirs: map[string]string{"hermes-atlas": dir}, lifecycle: map[string]*sync.Mutex{"hermes-atlas": &sync.Mutex{}}, busy: map[string]*atomic.Bool{"hermes-atlas": &atomic.Bool{}}, issues: map[string]string{}}
 	p := s.first("hermes-atlas")
 	if err := a.processMessage(context.Background(), "hermes-atlas", p); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if starts != 1 || posts != 1 || statuses < 2 || typings < 1 || len(replies) != 1 || replies[0] != "Hello from Hermes" || sessionID == "" {
-		t.Fatalf("start=%d posts=%d statuses=%d typing=%d replies=%v session=%q", starts, posts, statuses, typings, replies, sessionID)
+	if ups != 1 || posts != 1 || statuses < 2 || typings < 1 || sessionID == "" {
+		t.Fatalf("up=%d posts=%d statuses=%d typing=%d session=%q", ups, posts, statuses, typings, sessionID)
+	}
+	// The general service messages and final reply are all sent via sendMessage.
+	found := false
+	for _, r := range replies {
+		if r == "Hello from Hermes" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected Hermes reply in replies=%v", replies)
 	}
 	if s.first("hermes-atlas") != nil {
 		t.Fatal("pending item not removed")
+	}
+	// The bridge must adopt the existing key, not rotate it.
+	if got := s.apiKey("hermes-atlas"); got != "api-secret-0123456789abcdef" {
+		t.Fatalf("bridge did not adopt the member's key: %q", got)
+	}
+	if env := readEnvValue(t, envPath, "API_SERVER_KEY"); env != "api-secret-0123456789abcdef" {
+		t.Fatalf("member .env key was rewritten: %q", env)
+	}
+	if host := readEnvValue(t, envPath, "API_SERVER_HOST"); host != "0.0.0.0" {
+		t.Fatalf("member .env host wrong: %q", host)
 	}
 }
 
 func TestOnlyAllowedUsersAndTopicsRoute(t *testing.T) {
 	s, _ := openStore(t.TempDir(), -1009)
 	_ = s.setTopic("hermes-atlas", Topic{ID: 777, Title: "Atlas"})
-	app := &App{cfg: Config{GroupID: -1009, Allowed: map[int64]bool{42: true}, Containers: []string{"hermes-atlas"}}, state: s}
+	app := &App{cfg: Config{GroupID: -1009, Allowed: map[int64]bool{42: true}}, state: s, active: []string{"hermes-atlas"}}
 	mk := func(chatID, id int64, thread int, bot bool) Update {
 		var u Update
 		b, _ := json.Marshal(map[string]any{"update_id": 1, "message": map[string]any{"chat": map[string]any{"id": chatID}, "from": map[string]any{"id": id, "is_bot": bot}, "text": "hi", "message_thread_id": thread}})
@@ -278,7 +339,7 @@ func TestGeneralRoutesCommandsNotAgents(t *testing.T) {
 	_ = s.setTopic("hermes-atlas", Topic{ID: 777, Title: "Atlas"})
 	tg := newTelegram("TEST", -1009)
 	tg.base = server.URL + "/botTEST/"
-	app := &App{cfg: Config{GroupID: -1009, Allowed: map[int64]bool{42: true}, Containers: []string{"hermes-atlas"}}, state: s, telegram: tg, all: []string{"hermes-atlas"}, issues: map[string]string{}}
+	app := &App{cfg: Config{GroupID: -1009, Allowed: map[int64]bool{42: true}}, state: s, telegram: tg, active: []string{"hermes-atlas"}, all: []string{"hermes-atlas"}, issues: map[string]string{}}
 	mk := func(thread int, text string) Update {
 		var u Update
 		b, _ := json.Marshal(map[string]any{"update_id": 1, "message": map[string]any{"chat": map[string]any{"id": int64(-1009)}, "from": map[string]any{"id": 42, "is_bot": false}, "text": text, "message_thread_id": thread}})
@@ -316,23 +377,24 @@ func TestGeneralRoutesCommandsNotAgents(t *testing.T) {
 	}
 }
 
-func TestStatusReportsSkippedContainerIssues(t *testing.T) {
+func TestStatusReportsSkippedMemberIssues(t *testing.T) {
 	s, _ := openStore(t.TempDir(), -1009)
-	app := &App{cfg: Config{Containers: []string{"hermes-atlas"}}, state: s, all: []string{"hermes-atlas", "hermes-ghost"}, issues: map[string]string{}}
-	app.setIssue("hermes-ghost", "container not found")
+	app := &App{state: s, all: []string{"hermes-atlas", "hermes-ghost"}, active: []string{"hermes-atlas"}, issues: map[string]string{}}
+	app.setIssue("hermes-ghost", "no compose file in project directory")
 	msg := app.statusMessage()
-	if !strings.Contains(msg, "hermes-ghost: container not found") {
-		t.Fatalf("status missing skipped container issue: %q", msg)
+	if !strings.Contains(msg, "hermes-ghost: no compose file in project directory") {
+		t.Fatalf("status missing skipped member issue: %q", msg)
 	}
 	started := app.serviceStartMessage([]string{"hermes-atlas"}, time.Unix(0, 0))
-	if !strings.Contains(started, "Serving 1/2 containers") || !strings.Contains(started, "hermes-ghost: container not found") {
+	if !strings.Contains(started, "Serving 1/2 members") || !strings.Contains(started, "hermes-ghost: no compose file in project directory") {
 		t.Fatalf("startup banner wrong: %q", started)
 	}
 }
 
 func TestIdleStopsOnlyConfiguredContainers(t *testing.T) {
 	var mu sync.Mutex
-	stopCalls := 0
+	downs := 0
+	running := true
 	socket := filepath.Join(t.TempDir(), "docker.sock")
 	ln, err := net.Listen("unix", socket)
 	if err != nil {
@@ -344,9 +406,6 @@ func TestIdleStopsOnlyConfiguredContainers(t *testing.T) {
 		switch r.URL.Path {
 		case "/containers/hermes-atlas/json":
 			fmt.Fprint(w, `{"State":{"Running":true}}`)
-		case "/containers/hermes-atlas/stop":
-			stopCalls++
-			w.WriteHeader(204)
 		default:
 			http.Error(w, "unknown container", 404)
 		}
@@ -354,13 +413,40 @@ func TestIdleStopsOnlyConfiguredContainers(t *testing.T) {
 	dockerServer.Listener = ln
 	dockerServer.Start()
 	defer dockerServer.Close()
+	compose := newCompose()
+	compose.exec = func(ctx context.Context, args ...string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		rest := args
+		if len(rest) > 0 && rest[0] == "-f" {
+			rest = rest[4:] // skip -f <file> --project-directory <dir>
+		}
+		switch {
+		case rest[0] == "ps":
+			state := "created"
+			if running {
+				state = "running"
+			}
+			return []byte(fmt.Sprintf(`{"Name":"hermes-atlas","State":%q}`+"\n", state)), nil
+		case rest[0] == "down":
+			downs++
+			running = false
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("unexpected compose args %v", rest)
+		}
+	}
 	st, _ := openStore(t.TempDir(), -1009)
 	if err := st.touch("hermes-atlas"); err != nil {
 		t.Fatal(err)
 	}
-	app := &App{cfg: Config{Containers: []string{"hermes-atlas"}, IdleTimeout: 10 * time.Second}, state: st, docker: newDocker(socket), busy: map[string]*atomic.Bool{"hermes-atlas": &atomic.Bool{}}, lifecycle: map[string]*sync.Mutex{"hermes-atlas": &sync.Mutex{}}}
+	idleDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(idleDir, "docker-compose.yml"), []byte("services: {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: Config{IdleTimeout: 10 * time.Second}, state: st, docker: newDocker(socket), compose: compose, dirs: map[string]string{"hermes-atlas": idleDir}, active: []string{"hermes-atlas"}, busy: map[string]*atomic.Bool{"hermes-atlas": &atomic.Bool{}}, lifecycle: map[string]*sync.Mutex{"hermes-atlas": &sync.Mutex{}}}
 	app.stopIdle(context.Background())
-	if stopCalls != 0 {
+	if downs != 0 {
 		t.Fatal("stopped container before idle")
 	}
 	st.mu.Lock()
@@ -368,12 +454,25 @@ func TestIdleStopsOnlyConfiguredContainers(t *testing.T) {
 	st.mu.Unlock()
 	app.busy["hermes-atlas"].Store(true)
 	app.stopIdle(context.Background())
-	if stopCalls != 0 {
+	if downs != 0 {
 		t.Fatal("stopped busy container")
 	}
 	app.busy["hermes-atlas"].Store(false)
 	app.stopIdle(context.Background())
-	if stopCalls != 1 {
-		t.Fatalf("expected exactly one stopped container, got %d", stopCalls)
+	if downs != 1 {
+		t.Fatalf("expected exactly one down, got %d", downs)
 	}
+}
+
+// readEnvValue reads KEY=VALUE from a .env file path.
+func readEnvValue(t *testing.T, path, key string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := envValue(string(b), key); v != "" {
+		return v
+	}
+	return ""
 }
