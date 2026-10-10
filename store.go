@@ -29,6 +29,7 @@ type State struct {
 	Topics       map[string]Topic      `json:"topics"`
 	Pending      map[string][]*Pending `json:"pending"`
 	LastActivity map[string]time.Time  `json:"last_activity"`
+	APIKeys      map[string]string     `json:"api_keys,omitempty"`
 }
 type Store struct {
 	mu   sync.Mutex
@@ -40,7 +41,7 @@ func openStore(dir string, groupID int64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	st := &Store{path: filepath.Join(dir, "state.json"), s: State{GroupID: groupID, Topics: map[string]Topic{}, Pending: map[string][]*Pending{}, LastActivity: map[string]time.Time{}}}
+	st := &Store{path: filepath.Join(dir, "state.json"), s: State{GroupID: groupID, Topics: map[string]Topic{}, Pending: map[string][]*Pending{}, LastActivity: map[string]time.Time{}, APIKeys: map[string]string{}}}
 	data, err := os.ReadFile(st.path)
 	if err == nil {
 		if err = json.Unmarshal(data, &st.s); err != nil {
@@ -57,7 +58,7 @@ func openStore(dir string, groupID int64) (*Store, error) {
 			return nil, fmt.Errorf("Telegram group ID changed (%d -> %d) and cannot archive %s: %w", st.s.GroupID, groupID, st.path, err)
 		}
 		log.Printf("state: Telegram group ID changed (%d -> %d); archived old state to %s", st.s.GroupID, groupID, archive)
-		st.s = State{GroupID: groupID, Topics: map[string]Topic{}, Pending: map[string][]*Pending{}, LastActivity: map[string]time.Time{}}
+		st.s = State{GroupID: groupID, Topics: map[string]Topic{}, Pending: map[string][]*Pending{}, LastActivity: map[string]time.Time{}, APIKeys: map[string]string{}}
 	}
 	if st.s.Topics == nil {
 		st.s.Topics = map[string]Topic{}
@@ -67,6 +68,9 @@ func openStore(dir string, groupID int64) (*Store, error) {
 	}
 	if st.s.LastActivity == nil {
 		st.s.LastActivity = map[string]time.Time{}
+	}
+	if st.s.APIKeys == nil {
+		st.s.APIKeys = map[string]string{}
 	}
 	return st, nil
 }
@@ -117,6 +121,25 @@ func (st *Store) setTopic(name string, t Topic) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.s.Topics[name] = t
+	return st.save()
+}
+
+// apiKey returns the persisted Hermes API key for a member, if any.
+func (st *Store) apiKey(name string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.s.APIKeys[name]
+}
+
+// setAPIKey persists the key the bridge wrote into the member's .env so the same
+// key is reused across restarts even if the member's .env is later regenerated.
+func (st *Store) setAPIKey(name, key string) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.s.APIKeys[name] == key {
+		return nil
+	}
+	st.s.APIKeys[name] = key
 	return st.save()
 }
 func (st *Store) offset() int64 { st.mu.Lock(); defer st.mu.Unlock(); return st.s.Offset }

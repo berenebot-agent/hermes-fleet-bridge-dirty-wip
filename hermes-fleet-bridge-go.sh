@@ -43,6 +43,13 @@ TTY_FLAG=""
 if [ -t 1 ]; then TTY_FLAG="-it"; fi
 
 ENV_FLAGS="-e GOFLAGS=-p=2"
+# The repo is git-tracked but the toolchain container's user doesn't own it, so
+# build-like commands would fail VCS stamping (exit 128). Disable stamping for
+# those commands only (test/vet/gofmt don't accept the flag).
+GO_ARGS=()
+case "${1:-}" in
+build) GO_ARGS=(-buildvcs=false) ;;
+esac
 
 # Log capture: always write full output to a repo-local log file under
 # tests/logs/ (gitignored, persistent across runs). The summary printed at
@@ -84,7 +91,7 @@ else
         -v "$REPO_ROOT:/src" \
         -w /src \
         "$GO_IMAGE" \
-        go "$@" 2>&1 | tee "$LOG_FILE"
+        go "$1" "${GO_ARGS[@]}" "${@:2}" 2>&1 | tee "$LOG_FILE"
 fi
 rc=${PIPESTATUS[0]}
 te=$(date +%s)

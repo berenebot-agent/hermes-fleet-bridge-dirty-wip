@@ -3,11 +3,27 @@ services:
     build: .
     container_name: hermes-fleet-bridge
     restart: unless-stopped
+    # Run as the host user so the bridge can write each member's data/.env and
+    # the state file, and so files it creates are owned by the same uid the
+    # Hermes containers run as (HERMES_UID/GID). The docker group GID grants
+    # access to the mounted /var/run/docker.sock.
+    user: "${BRIDGE_UID:-1000}:${BRIDGE_GID:-1000}"
+    group_add:
+      - "${DOCKER_GID:-987}"
     network_mode: host # Linux: access Hermes' Docker bridge IPs without network reconfiguration
     env_file: .env
     volumes:
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock
+      # Each fleet member's compose project directory, mounted at the SAME
+      # absolute path as on the host so the project's relative bind mounts
+      # (e.g. ./data) resolve correctly when the bridge runs `docker compose`.
+      # Read-write: the bridge writes API_SERVER_* into each member's persistent
+      # data/.env. Add one line per directory listed in HERMES_DIRS.
+      - /home/ben/projects/hermes-fleet-bridge/agents/redshirt-one:/home/ben/projects/hermes-fleet-bridge/agents/redshirt-one
+      - /home/ben/projects/hermes-fleet-bridge/agents/redshirt-two:/home/ben/projects/hermes-fleet-bridge/agents/redshirt-two
+      - /home/ben/projects/hermes-fleet-bridge/agents/redshirt-three:/home/ben/projects/hermes-fleet-bridge/agents/redshirt-three
+      - /home/ben/projects/testpilot-hermes:/home/ben/projects/testpilot-hermes
     read_only: true
     tmpfs:
       - /tmp

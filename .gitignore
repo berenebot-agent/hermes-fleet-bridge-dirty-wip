@@ -9,6 +9,7 @@ data/
 # bundles or ./data backups (large, and backups contain chat state).
 *.zip
 bridge
+hermes-fleet-bridge
 
 # Test logs (gitignored, persistent across runs).
 tests/logs/

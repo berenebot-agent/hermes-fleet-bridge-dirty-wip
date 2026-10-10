@@ -103,12 +103,13 @@ func infoEnv(info ContainerInfo, k string) string {
 
 // On Linux with host networking, reach the inspected container via its Docker bridge IP.
 // Never trust or use container-supplied DNS names to construct an arbitrary destination.
-func (c Config) hermesEndpoint(info ContainerInfo) (string, string, error) {
+// The API key is supplied separately (the bridge owns it via the member's .env).
+func (c Config) hermesEndpoint(info ContainerInfo) (string, error) {
 	port := c.DefaultPort
 	if p := infoEnv(info, "API_SERVER_PORT"); p != "" {
 		v, err := strconv.Atoi(p)
 		if err != nil || v < 1 || v > 65535 {
-			return "", "", fmt.Errorf("invalid API_SERVER_PORT in %s", info.Name)
+			return "", fmt.Errorf("invalid API_SERVER_PORT in %s", info.Name)
 		}
 		port = v
 	}
@@ -120,7 +121,7 @@ func (c Config) hermesEndpoint(info ContainerInfo) (string, string, error) {
 			if x, ok := info.NetworkSettings.Networks[c.PreferredNetwork]; ok {
 				host = x.IPAddress
 			} else {
-				return "", "", fmt.Errorf("container %s not on HERMES_NETWORK=%s", info.Name, c.PreferredNetwork)
+				return "", fmt.Errorf("container %s not on HERMES_NETWORK=%s", info.Name, c.PreferredNetwork)
 			}
 		}
 		if host == "" {
@@ -138,14 +139,7 @@ func (c Config) hermesEndpoint(info ContainerInfo) (string, string, error) {
 		}
 	}
 	if net.ParseIP(host) == nil {
-		return "", "", fmt.Errorf("container %s has no reachable IPv4 address; use Docker bridge or host networking", info.Name)
+		return "", fmt.Errorf("container %s has no reachable IPv4 address; use Docker bridge or host networking", info.Name)
 	}
-	key := infoEnv(info, "API_SERVER_KEY")
-	if key == "" {
-		key = c.FallbackKey
-	}
-	if key == "" {
-		return "", "", fmt.Errorf("no API_SERVER_KEY in %s environment or HERMES_API_KEY fallback", info.Name)
-	}
-	return "http://" + net.JoinHostPort(host, strconv.Itoa(port)), key, nil
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port)), nil
 }

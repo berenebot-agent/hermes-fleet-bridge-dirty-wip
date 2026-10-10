@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
-	"regexp"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -13,17 +13,22 @@ type Config struct {
 	Token                                 string
 	GroupID                               int64
 	Allowed                               map[int64]bool
-	Containers                            []string
+	Members                               []Member
 	IdleTimeout, StartTimeout, RunTimeout time.Duration
 	DataDir, DockerSocket                 string
 	DefaultPort                           int
-	FallbackKey, PreferredNetwork         string
+	PreferredNetwork                      string
 }
 
-var dockerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+// Member is one fleet agent: a name (its topic/state identity) and the compose
+// project directory that defines it.
+type Member struct {
+	Name string
+	Dir  string
+}
 
 func loadConfig() (Config, error) {
-	c := Config{Allowed: map[int64]bool{}, DockerSocket: getEnv("DOCKER_SOCKET", "/var/run/docker.sock"), DataDir: getEnv("DATA_DIR", "/data"), FallbackKey: os.Getenv("HERMES_API_KEY"), PreferredNetwork: os.Getenv("HERMES_NETWORK")}
+	c := Config{Allowed: map[int64]bool{}, DockerSocket: getEnv("DOCKER_SOCKET", "/var/run/docker.sock"), DataDir: getEnv("DATA_DIR", "/data"), PreferredNetwork: os.Getenv("HERMES_NETWORK")}
 	c.Token = strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	if c.Token == "" {
 		return c, fmt.Errorf("TELEGRAM_BOT_TOKEN required")
@@ -47,22 +52,27 @@ func loadConfig() (Config, error) {
 		return c, fmt.Errorf("TELEGRAM_ALLOWED_USER_IDS required (fail closed)")
 	}
 	seen := map[string]bool{}
-	for _, s := range strings.Split(os.Getenv("HERMES_CONTAINERS"), ",") {
-		n := strings.TrimSpace(s)
-		if n == "" {
+	for _, s := range strings.Split(os.Getenv("HERMES_DIRS"), ",") {
+		d := strings.TrimSpace(s)
+		if d == "" {
 			continue
 		}
-		if !dockerNamePattern.MatchString(n) {
-			return c, fmt.Errorf("invalid container name %q", n)
+		if !filepath.IsAbs(d) {
+			return c, fmt.Errorf("HERMES_DIRS entry must be an absolute path: %q", d)
 		}
-		if seen[n] {
-			return c, fmt.Errorf("duplicate container %q", n)
+		d = filepath.Clean(d)
+		name := filepath.Base(d)
+		if name == "." || name == "/" || name == "" {
+			return c, fmt.Errorf("cannot derive agent name from directory %q", d)
 		}
-		seen[n] = true
-		c.Containers = append(c.Containers, n)
+		if seen[name] {
+			return c, fmt.Errorf("duplicate agent name %q (from %s)", name, d)
+		}
+		seen[name] = true
+		c.Members = append(c.Members, Member{Name: name, Dir: d})
 	}
-	if len(c.Containers) == 0 {
-		return c, fmt.Errorf("HERMES_CONTAINERS required")
+	if len(c.Members) == 0 {
+		return c, fmt.Errorf("HERMES_DIRS required (comma-separated absolute compose project directories)")
 	}
 	c.IdleTimeout, err = time.ParseDuration(getEnv("IDLE_TIMEOUT", "15m"))
 	if err != nil || c.IdleTimeout < 10*time.Second {
