@@ -41,10 +41,10 @@ transport/support files plus `main.go`:
 
 | File | Responsibility |
 |---|---|
-| `config.go` | Environment parsing and validation; topic-name derivation |
+| `config.go` | Environment parsing and validation; topic-name derivation; topic-icon assignment |
 | `compose.go` | Per-member `docker compose` lifecycle (up/down/ps/config) and API-env provisioning |
 | `docker.go` | Docker Engine API over the mounted unix socket (inspect); endpoint discovery |
-| `telegram.go` | Telegram Bot API (long polling, topics, typing, send); UTF-16-safe splitting |
+| `telegram.go` | Telegram Bot API (long polling, topics, topic icons, typing, send); UTF-16-safe splitting |
 | `hermes.go` | Hermes agent API client (`/health`, `/v1/runs`, run status/stop) |
 | `store.go` | Durable JSON state: update offset, topic map, per-agent queues, activity, API keys |
 | `main.go` | Wiring: poll loop, per-agent workers, topic monitor, idle monitor, command handling |
@@ -156,6 +156,15 @@ The topic monitor runs at startup and every minute:
 No Telegram topic IDs are configured by hand. Thread IDs live only in state, so
 the mapping survives restarts.
 
+Each topic also gets a distinctive icon. The icon emoji and one of Telegram's
+six topic colours are hash-assigned from the member name, so a member always
+looks the same. `HERMES_ICONS` (`member=emoji`) pins an emoji per member; an
+emoji Telegram rejects as a topic icon falls back to the derived one. Telegram's
+allowed topic-icon emoji are fetched once via `getForumTopicIconStickers` and
+cached; until that succeeds topics are colour-only. The chosen emoji is stored
+in state and re-applied via `editForumTopic` for legacy topics. The colour is
+set only at creation, as the Bot API cannot change it afterwards.
+
 ## Durable state
 
 A single JSON file, `DATA_DIR/state.json`, mode `0600`, written by atomic
@@ -166,7 +175,7 @@ truncate it. It holds:
 |---|---|
 | `group_id` | The Telegram group this state belongs to |
 | `offset` | Next Telegram update offset to request |
-| `topics` | Member name → `{thread id, current title}` |
+| `topics` | Member name → `{thread id, current title, icon emoji + custom-emoji id}` |
 | `pending` | Member name → FIFO queue of turns (text, run ID, reply, sent cursor, attempts) |
 | `last_activity` | Member name → timestamp of last completed turn |
 | `api_keys` | Member name → the Hermes API key the bridge provisioned |

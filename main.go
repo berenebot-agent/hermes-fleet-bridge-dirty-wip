@@ -32,6 +32,9 @@ type App struct {
 	active    []string
 	issuesMu  sync.Mutex
 	issues    map[string]string
+	iconsMu   sync.Mutex
+	icons     []forumIconRef
+	iconIDs   map[string]string
 }
 
 // dir resolves a member name to its compose project directory. Empty if unknown.
@@ -129,25 +132,81 @@ func (a *App) checkMembers(ctx context.Context) {
 	}
 }
 func (a *App) syncTopics(ctx context.Context) {
+	a.ensureIconPool(ctx)
 	for _, agent := range a.active {
 		if err := a.ensureTopic(ctx, agent, false); err != nil {
 			log.Printf("topic %s: %v", agent, err)
 		}
 	}
 }
+
+// ensureIconPool fetches Telegram's topic-icon emoji pool once; until it
+// succeeds it is retried on every sync tick (colour-only until then).
+func (a *App) ensureIconPool(ctx context.Context) {
+	a.iconsMu.Lock()
+	defer a.iconsMu.Unlock()
+	if a.icons != nil {
+		return
+	}
+	pool, err := a.telegram.getForumTopicIcons(ctx)
+	if err != nil {
+		log.Printf("topic icon pool unavailable: %v", err)
+		return
+	}
+	if len(pool) == 0 {
+		// A valid empty pool is final: colour-only topics.
+		a.icons = []forumIconRef{}
+		a.iconIDs = map[string]string{}
+		return
+	}
+	a.icons = pool
+	a.iconIDs = make(map[string]string, len(pool))
+	for _, r := range pool {
+		if _, ok := a.iconIDs[r.Emoji]; !ok {
+			a.iconIDs[r.Emoji] = r.CustomID
+		}
+	}
+	log.Printf("topic icon pool: %d emoji", len(pool))
+}
+
+// memberIcon resolves the desired topic icon for a member: a configured
+// override if any, otherwise hash-based assignment. The emoji ID is resolved
+// against the cached pool; unknown override emoji warn and fall back to the hash.
+func (a *App) memberIcon(agent string) forumTopicIcon {
+	a.iconsMu.Lock()
+	pool := a.icons
+	ids := a.iconIDs
+	a.iconsMu.Unlock()
+	emojis := make([]string, len(pool))
+	for i, r := range pool {
+		emojis[i] = r.Emoji
+	}
+	icon := pickTopicIcon(agent, a.cfg.IconOverrides[agent], emojis)
+	if icon.Emoji != "" && len(pool) > 0 {
+		if id := ids[icon.Emoji]; id != "" {
+			icon.EmojiID = id
+		} else if a.cfg.IconOverrides[agent] != "" {
+			log.Printf("topic icon %s is not in Telegram's topic-icon pool; %s falls back to hash assignment", icon.Emoji, agent)
+			icon.Emoji = pickTopicIcon(agent, "", emojis).Emoji
+			icon.EmojiID = ids[icon.Emoji]
+		}
+	}
+	return icon
+}
 func (a *App) ensureTopic(ctx context.Context, agent string, force bool) error {
 	title := topicName(agent)
+	icon := a.memberIcon(agent)
 	if t, ok := a.state.topic(agent); ok && !force {
-		if t.Title == title {
+		if t.Title == title && t.IconEmojiID == icon.EmojiID {
 			return nil
 		}
-		err := a.telegram.editTopic(ctx, t.ID, title)
+		err := a.telegram.editTopic(ctx, t.ID, title, icon.EmojiID)
 		if err == nil {
-			if t.Title != title {
-				if err := a.state.setTopic(agent, Topic{ID: t.ID, Title: title}); err != nil {
+			if t.Title != title || t.IconEmojiID != icon.EmojiID {
+				if err := a.state.setTopic(agent, Topic{ID: t.ID, Title: title, IconEmoji: icon.Emoji, IconEmojiID: icon.EmojiID}); err != nil {
 					return err
 				}
-				log.Printf("topic renamed: %s (%d)", title, t.ID)
+				log.Printf("topic updated: %s (%d)", title, t.ID)
 			}
 			return nil
 		}
@@ -156,7 +215,7 @@ func (a *App) ensureTopic(ctx context.Context, agent string, force bool) error {
 		}
 		log.Printf("topic missing for %s; recreating", agent)
 	}
-	t, err := a.telegram.createTopic(ctx, title)
+	t, err := a.telegram.createTopic(ctx, title, icon)
 	if err != nil {
 		return err
 	}

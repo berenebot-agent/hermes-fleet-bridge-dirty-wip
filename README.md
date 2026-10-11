@@ -59,12 +59,14 @@ On typical Linux Docker installations, `network_mode: host` lets the bridge talk
 | `RUN_TIMEOUT` | No | Defaults to `60m`; asks Hermes to stop a timed-out run |
 | `HERMES_API_PORT` | No | API server port written into each member's `.env` (default `8642`) |
 | `HERMES_NETWORK` | No | Choose named Docker network where multiple exist |
+| `HERMES_ICONS` | No | Pin topic icons, `member=emoji` comma-separated; others are hash-assigned |
 | `DATA_DIR` | No | Defaults to `/data` |
 | `DOCKER_SOCKET` | No | Defaults to `/var/run/docker.sock` |
 
 ## Behaviour
 
 - **Topic management:** On startup, create topics for configured members, or rename mapped topics when the generated title changes. A member whose directory has no compose file is skipped (no topic created) and reported in **General**. No Telegram topic ID configuration needed.
+- **Topic icons:** Every topic gets a visually distinctive icon. Each member is assigned a topic-icon emoji and one of Telegram's six topic colours deterministically from its name, so the same member always looks the same. Pin a specific emoji per member with `HERMES_ICONS` (e.g. `HERMES_ICONS=redshirt-one=🚀`); an emoji Telegram doesn't allow as a topic icon falls back to the derived one with a log warning. Existing topics are backfilled with their icon on the next sync. The colour is fixed when the topic is first created (Telegram cannot change it later).
 - **General (service channel):** The forum's built-in **General** topic is the control channel for the bridge itself. On startup the bridge posts a service-start banner listing the members it serves and any member problems. It re-checks members every minute and posts an alert in General when a project directory becomes unusable, and a recovery note when it comes back. `GET`-free commands `/status` and `/help` are accepted in General; General text is never routed to an agent.
 - **Security:** Ignore all messages outside the configured group, all unapproved users, bot-originated messages, empty/non-text messages, and messages in unknown topics.
 - **Multiplexing:** Each configured member has its own independent FIFO text queue; separate members run concurrently.

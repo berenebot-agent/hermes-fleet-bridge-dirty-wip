@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -79,22 +80,59 @@ func (t *Telegram) getUpdates(ctx context.Context, offset int64) ([]Update, erro
 	err := t.call(ctx, "getUpdates", map[string]any{"offset": offset, "timeout": 25, "limit": 100, "allowed_updates": []string{"message"}}, &list)
 	return list, err
 }
-func (t *Telegram) createTopic(ctx context.Context, title string) (Topic, error) {
+
+// forumTopicIcon is the visual identity of a forum topic: one of the six fixed
+// topic colours and an optional custom emoji from getForumTopicIconStickers.
+type forumTopicIcon struct {
+	Color   int
+	Emoji   string
+	EmojiID string
+}
+
+// forumIconRef is one entry of Telegram's topic-icon sticker pool: the exact
+// emoji and its custom-emoji identifier.
+type forumIconRef struct {
+	Emoji    string `json:"emoji"`
+	CustomID string `json:"custom_emoji_id"`
+}
+
+// getForumTopicIcons returns the allowed custom emoji for topic icons,
+// sorted for deterministic hash-based assignment. An empty result on error
+// is not fatal: callers fall back to colour-only topics.
+func (t *Telegram) getForumTopicIcons(ctx context.Context) ([]forumIconRef, error) {
+	var list []forumIconRef
+	err := t.call(ctx, "getForumTopicIconStickers", map[string]any{}, &list)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Emoji < list[j].Emoji })
+	return list, nil
+}
+
+func (t *Telegram) createTopic(ctx context.Context, title string, icon forumTopicIcon) (Topic, error) {
 	var v struct {
 		MessageThreadID int    `json:"message_thread_id"`
 		Name            string `json:"name"`
 	}
-	err := t.call(ctx, "createForumTopic", map[string]any{"chat_id": t.group, "name": title}, &v)
+	body := map[string]any{"chat_id": t.group, "name": title, "icon_color": icon.Color}
+	if icon.EmojiID != "" {
+		body["icon_custom_emoji_id"] = icon.EmojiID
+	}
+	err := t.call(ctx, "createForumTopic", body, &v)
 	if err != nil {
 		return Topic{}, err
 	}
 	if v.MessageThreadID == 0 {
 		return Topic{}, fmt.Errorf("Telegram created topic with missing ID")
 	}
-	return Topic{ID: v.MessageThreadID, Title: title}, nil
+	return Topic{ID: v.MessageThreadID, Title: title, IconEmoji: icon.Emoji, IconEmojiID: icon.EmojiID}, nil
 }
-func (t *Telegram) editTopic(ctx context.Context, id int, title string) error {
-	err := t.call(ctx, "editForumTopic", map[string]any{"chat_id": t.group, "message_thread_id": id, "name": title}, nil)
+func (t *Telegram) editTopic(ctx context.Context, id int, title string, emojiID string) error {
+	body := map[string]any{"chat_id": t.group, "message_thread_id": id, "name": title}
+	if emojiID != "" {
+		body["icon_custom_emoji_id"] = emojiID
+	}
+	err := t.call(ctx, "editForumTopic", body, nil)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "topic_not_modified") {
 		return nil
 	}

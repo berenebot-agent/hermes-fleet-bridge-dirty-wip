@@ -32,6 +32,51 @@ func TestSplitTelegramUTF16(t *testing.T) {
 	if a != c || b == "" {
 		t.Fatal("session not deterministic")
 	}
+	if overrides, err := parseIconOverrides(""); err != nil || len(overrides) > 0 {
+		t.Fatalf("empty override set expected, got %v err=%v", overrides, err)
+	}
+	overrides, err := parseIconOverrides("redshirt-one=🚀, redshirt-two=🎯")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overrides["redshirt-one"] != "🚀" || overrides["redshirt-two"] != "🎯" || len(overrides) != 2 {
+		t.Fatalf("bad overrides: %v", overrides)
+	}
+	for _, bad := range []string{"noundo", "two=🚀,two=🎯", "=🚀", "x=", "has space=🚀"} {
+		if _, err := parseIconOverrides(bad); err == nil {
+			t.Fatalf("expected error for %q", bad)
+		}
+	}
+	icon1 := pickTopicIcon("hermes-atlas", "", []string{"🚀", "🎯"})
+	icon2 := pickTopicIcon("hermes-atlas", "", []string{"🚀", "🎯"})
+	if icon1 != icon2 || icon1.Emoji == "" {
+		t.Fatal("icon assignment not deterministic")
+	}
+	if pickTopicIcon("hermes-atlas", "🦌", []string{"🚀", "🎯"}).Emoji != "🦌" {
+		t.Fatal("override emoji not honoured")
+	}
+	colours := map[int]bool{}
+	for i := 0; i < 64; i++ {
+		ic := pickTopicIcon(fmt.Sprintf("hermes-member-%d", i), "", nil)
+		if ic.Emoji != "" {
+			t.Fatal("colour-only icon must have no emoji")
+		}
+		colours[ic.Color] = true
+	}
+	if len(colours) < 2 {
+		t.Fatalf("colour hashing collapsed: %v", colours)
+	}
+	for c := range colours {
+		valid := false
+		for _, v := range topicIconColors {
+			if c == v {
+				valid = true
+			}
+		}
+		if !valid {
+			t.Fatalf("invalid topic colour %d", c)
+		}
+	}
 }
 
 func TestDurableStateQueueAndOffset(t *testing.T) {
@@ -82,14 +127,24 @@ func TestDurableStateQueueAndOffset(t *testing.T) {
 func TestTelegramAutoTopics(t *testing.T) {
 	var mu sync.Mutex
 	var methods []string
+	var bodies []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method := strings.TrimPrefix(r.URL.Path, "/botTEST/")
 		mu.Lock()
 		methods = append(methods, method)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body)
 		mu.Unlock()
 		var result any = true
-		if method == "createForumTopic" {
+		switch method {
+		case "createForumTopic":
 			result = map[string]any{"message_thread_id": 555, "name": "Atlas"}
+		case "getForumTopicIconStickers":
+			result = []map[string]any{
+				{"emoji": "🎯", "custom_emoji_id": "5312345678900000002"},
+				{"emoji": "🚀", "custom_emoji_id": "5312345678900000001"},
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": result})
@@ -102,21 +157,59 @@ func TestTelegramAutoTopics(t *testing.T) {
 	if err := a.ensureTopic(context.Background(), "hermes-atlas", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.setTopic("hermes-atlas", Topic{ID: 555, Title: "Old Name"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.ensureTopic(context.Background(), "hermes-atlas", false); err != nil {
-		t.Fatal(err)
-	}
 	topic, ok := s.topic("hermes-atlas")
-	if !ok || topic.ID != 555 || topic.Title != "Atlas" {
+	if !ok || topic.ID != 555 {
 		t.Fatalf("bad mapping %+v", topic)
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	if len(methods) != 2 || methods[0] != "createForumTopic" || methods[1] != "editForumTopic" {
+	// First ensureTopic in this test runs with an empty pool: colour-only.
+	if len(methods) != 1 || methods[0] != "createForumTopic" {
+		mu.Unlock()
 		t.Fatalf("unexpected methods: %v", methods)
 	}
+	if n := bodies[0]["icon_color"]; n == nil || n.(float64) == 0 {
+		mu.Unlock()
+		t.Fatalf("expected a hashed icon colour on create, got %v", bodies[0]["icon_color"])
+	}
+	if _, ok := bodyIconEmojiID(bodies[0]); ok {
+		mu.Unlock()
+		t.Fatalf("expected no emoji without a pool, got %v", bodies[0])
+	}
+	mu.Unlock()
+	// With the pool fetched (first sync tick) the topic is backfilled via edit.
+	a.ensureIconPool(context.Background())
+	if err := a.ensureTopic(context.Background(), "hermes-atlas", false); err != nil {
+		t.Fatal(err)
+	}
+	topic, _ = s.topic("hermes-atlas")
+	if topic.IconEmojiID == "" || topic.IconEmoji == "" {
+		t.Fatalf("icon not persisted: %+v", topic)
+	}
+	mu.Lock()
+	if len(methods) != 3 || methods[2] != "editForumTopic" {
+		mu.Unlock()
+		t.Fatalf("unexpected methods after pool fetch: %v", methods)
+	}
+	if id, _ := bodyIconEmojiID(bodies[2]); id == "" {
+		mu.Unlock()
+		t.Fatalf("expected icon on backfill edit, got %v", bodies[2])
+	}
+	mu.Unlock()
+	// No-op when title and icon already match (no further Telegram calls).
+	before := len(bodies)
+	if err := a.ensureTopic(context.Background(), "hermes-atlas", false); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != before {
+		t.Fatalf("unexpected extra calls: %v", methods[before:])
+	}
+}
+
+func bodyIconEmojiID(body map[string]any) (string, bool) {
+	v, ok := body["icon_custom_emoji_id"].(string)
+	return v, ok && v != ""
 }
 
 func TestSleepingContainerWakeRunTypingAndReply(t *testing.T) {

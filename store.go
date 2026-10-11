@@ -13,6 +13,11 @@ import (
 type Topic struct {
 	ID    int    `json:"id"`
 	Title string `json:"title"`
+	// IconEmoji is the desired icon emoji (exact Telegram emoji) and
+	// IconEmojiID its Telegram custom-emoji identifier. Empty ID on a mapped
+	// topic means the icon still needs to be backfilled via editForumTopic.
+	IconEmoji   string `json:"icon_emoji,omitempty"`
+	IconEmojiID string `json:"icon_emoji_id,omitempty"`
 }
 type Pending struct {
 	UpdateID  int64  `json:"update_id"`

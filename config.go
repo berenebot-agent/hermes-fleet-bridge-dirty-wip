@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,9 @@ type Config struct {
 	DataDir, DockerSocket                 string
 	DefaultPort                           int
 	PreferredNetwork                      string
+	// IconOverrides maps a member name to the exact Telegram emoji requested
+	// as its topic icon. Empty means hash-based assignment.
+	IconOverrides map[string]string
 }
 
 // Member is one fleet agent: a name (its topic/state identity) and the compose
@@ -90,7 +94,38 @@ func loadConfig() (Config, error) {
 	if err != nil || c.DefaultPort < 1 || c.DefaultPort > 65535 {
 		return c, fmt.Errorf("invalid HERMES_API_PORT")
 	}
+	if c.IconOverrides, err = parseIconOverrides(os.Getenv("HERMES_ICONS")); err != nil {
+		return c, err
+	}
+	for name := range c.IconOverrides {
+		if !seen[name] {
+			return c, fmt.Errorf("HERMES_ICONS references unknown member %q", name)
+		}
+	}
 	return c, nil
+}
+
+// parseIconOverrides parses HERMES_ICONS entries of the form "member=emoji",
+// comma-separated. The emoji may be any Telegram emoji; whether Telegram
+// accepts it as a topic icon is checked at runtime against the sticker pool.
+func parseIconOverrides(s string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, emoji, ok := strings.Cut(entry, "=")
+		name, emoji = strings.TrimSpace(name), strings.TrimSpace(emoji)
+		if !ok || name == "" || emoji == "" || strings.ContainsAny(name, " =") {
+			return nil, fmt.Errorf("invalid HERMES_ICONS entry %q (want member=emoji)", entry)
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("duplicate HERMES_ICONS member %q", name)
+		}
+		out[name] = emoji
+	}
+	return out, nil
 }
 func getEnv(k, def string) string {
 	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
@@ -117,4 +152,26 @@ func topicName(container string) string {
 		n = string(r[:64])
 	}
 	return n
+}
+
+// topicIconColors are the only colours Telegram accepts for topic icons.
+// The colour is fixed at creation; editForumTopic cannot change it.
+var topicIconColors = []int{7322096, 16766590, 13338331, 9367192, 16749490, 16478047}
+
+// pickTopicIcon derives a member's topic icon from its container name: the
+// emoji (when the pool is non-empty) and the colour are hash-assigned, so the
+// same name always yields the same icon without any state. A manual override
+// wins.
+func pickTopicIcon(name, override string, pool []string) forumTopicIcon {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("telegram:topic:icon:" + name))
+	sum := h.Sum64()
+	icon := forumTopicIcon{Color: topicIconColors[int(sum%uint64(len(topicIconColors)))]}
+	if len(pool) > 0 {
+		icon.Emoji = pool[int((sum>>32)%uint64(len(pool)))]
+	}
+	if override != "" {
+		icon.Emoji = override
+	}
+	return icon
 }
